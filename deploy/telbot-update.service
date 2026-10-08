@@ -1,0 +1,7 @@
+[Unit]
+Description=Deploy the latest Telegram bot code from GitHub
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tel-bot/deploy/update.sh

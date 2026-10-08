@@ -1,0 +1,6 @@
+.env
+memory.db
+.venv/
+__pycache__/
+.deploy-skip
+.DS_Store

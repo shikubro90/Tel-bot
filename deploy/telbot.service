@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram personal assistant bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=telbot
+WorkingDirectory=/opt/tel-bot
+ExecStart=/opt/tel-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
