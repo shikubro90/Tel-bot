@@ -2,16 +2,16 @@
 
 A private Telegram personal assistant. It answers only its owner, remembers
 what it learns about them in a local SQLite file, and uses a local Ollama model
-by default. Claude is an optional helper for fresh or expert information,
-photos, and for the times Ollama can't be reached.
+by default. Claude is an optional helper for fresh or expert information and
+for photos.
 
 ## How it runs
 
 - **Bot:** `bot.py`, on a small Linux server, as a systemd service.
 - **Ollama:** on the owner's Mac. The Mac keeps a private SSH tunnel open to
   the server, so the bot reaches Ollama at `127.0.0.1:11434`.
-- **Mac off or asleep:** the tunnel is down, so the bot says so and lets Claude
-  give a short answer instead.
+- **Mac off or asleep:** the tunnel is down, so the bot only says so. Claude
+  words the first notice of an outage; repeats are a fixed line.
 
 ## Settings
 
