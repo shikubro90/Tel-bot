@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +30,7 @@ import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -52,6 +54,11 @@ CLAUDE_DAILY_LIMIT = int(os.getenv("CLAUDE_DAILY_LIMIT", "20"))
 DB_PATH = BASE_DIR / "memory.db"
 
 TELEGRAM_MAX_LEN = 4096
+# The local model saying it will ask Claude, e.g. "Let me ask Claude."
+ASKS_CLAUDE = re.compile(
+    r"\b(ask|check with|consult|get help from|reach out to)\s+(my\s+)?(\w+\s+){0,3}?claude\b",
+    re.IGNORECASE,
+)
 CLAUDE_MAX_CONTINUATIONS = 3
 PHOTO_MAX_SIDE = 800
 
@@ -177,9 +184,13 @@ def system_prompt() -> str:
         "no bullet lists unless asked. Use what you know about the user naturally, "
         "without reciting it back. If you don't know something, say so.\n\n"
         f"If asked what you run on: you are the open model {OLLAMA_MODEL}, running "
-        "locally on the user's own Mac through Ollama. For things you can't answer "
-        "alone you can get help from Claude, a cloud model. Never invent another "
+        "locally on the user's own Mac through Ollama. Never invent another "
         "model name.\n\n"
+        "Claude is a cloud model that can help you. When you cannot answer "
+        'something yourself, reply with only "Let me ask Claude." and nothing '
+        "else; the answer is then looked up and given to you. Never say that "
+        "Claude said, did or will do anything unless it is in looked-up "
+        "information in square brackets.\n\n"
         "Sometimes a message is followed by looked-up information in square "
         "brackets. Trust it over your own memory and base your answer on it, "
         "keeping the facts, numbers and dates exactly as given.\n\n"
@@ -400,14 +411,16 @@ async def reply_without_mac(update: Update, user_text: str, info: Optional[str])
     await send_long(update, reply)
 
 
-async def reply_locally(update: Update, user_text: str, info: Optional[str] = None) -> bool:
+async def reply_locally(
+    update: Update, user_text: str, info: Optional[str] = None
+) -> Optional[str]:
     """Answer the conversation so far with the local model.
 
-    Returns False when Ollama was unreachable and Claude filled in instead.
+    Returns the reply, or None when Ollama was unreachable and Claude filled in.
     """
     if not await ollama_online():
         await reply_without_mac(update, user_text, info)
-        return False
+        return None
     messages = [{"role": "system", "content": system_prompt()}]
     messages += recent_messages(HISTORY_LIMIT)
     try:
@@ -415,10 +428,28 @@ async def reply_locally(update: Update, user_text: str, info: Optional[str] = No
     except httpx.HTTPError as exc:
         log.error("Ollama request failed: %s", exc)
         await reply_without_mac(update, user_text, info)
-        return False
+        return None
+    reply = reply or "…"
     save_message("assistant", reply)
-    await send_long(update, reply or "…")
-    return True
+    await send_long(update, reply)
+    return reply
+
+
+async def follow_up_with_claude(update: Update, user_text: str) -> None:
+    """The local model said it would ask Claude: do it and send the answer unprompted."""
+    log.info("Local model asked for Claude, following up")
+    info = None
+    if claude_available():
+        info = await look_up(
+            f"A user asked their Telegram assistant bot this: {user_text}", use_web=False
+        )
+    if info:
+        await reply_locally(update, user_text, info)
+    else:
+        await update.message.reply_text(
+            "I couldn't get an answer from Claude right now. It may not be set up, "
+            "or I've used today's requests."
+        )
 
 
 async def look_up(question: str, use_web: bool) -> Optional[str]:
@@ -445,7 +476,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if route != "local":
                 log.info("Asking Claude (%s)", route)
                 info = await look_up(question, use_web=(route == "web"))
-        answered_locally = await reply_locally(update, user_text, info)
+        reply = await reply_locally(update, user_text, info)
+        answered_locally = reply is not None
+        # If the model only promised to ask Claude, keep that promise now so
+        # the user doesn't have to send another message.
+        if reply and info is None and ASKS_CLAUDE.search(reply):
+            await follow_up_with_claude(update, user_text)
     finally:
         typing.cancel()
 
@@ -588,6 +624,16 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Chat history cleared. I still know you, though.")
 
 
+async def sync_bot_name(app: Application) -> None:
+    """Make the name shown at the top of the Telegram chat match ASSISTANT_NAME."""
+    try:
+        if (await app.bot.get_my_name()).name != ASSISTANT_NAME:
+            await app.bot.set_my_name(ASSISTANT_NAME)
+            log.info("Telegram display name set to %s", ASSISTANT_NAME)
+    except TelegramError as exc:
+        log.warning("Could not set the Telegram display name: %s", exc)
+
+
 def main() -> None:
     if not BOT_TOKEN or not OWNER_ID.isdigit():
         sys.exit("Fill in TELEGRAM_BOT_TOKEN and OWNER_ID in the .env file first.")
@@ -601,7 +647,7 @@ def main() -> None:
     # Owner lock: every handler ignores anyone who isn't OWNER_ID.
     owner = filters.User(user_id=int(OWNER_ID))
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(sync_bot_name).build()
     app.add_handler(CommandHandler("start", cmd_start, filters=owner))
     app.add_handler(CommandHandler("ask", cmd_ask, filters=owner))
     app.add_handler(CommandHandler("usage", cmd_usage, filters=owner))
