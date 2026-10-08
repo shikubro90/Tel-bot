@@ -4,3 +4,4 @@ memory.db
 __pycache__/
 .deploy-skip
 .DS_Store
+.cache/
