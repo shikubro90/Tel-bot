@@ -9,8 +9,7 @@ owner sends a photo, or on /ask. Claude never sees the chat history or the
 remembered facts, only the single question or photo.
 
 The bot can run on a server while Ollama stays on the owner's Mac. When the
-Mac is off, the bot only says so: Claude words the first notice, repeats are a
-fixed line.
+Mac is off, the bot says so and Claude gives a short answer instead.
 """
 
 import asyncio
@@ -351,17 +350,18 @@ RESEARCH_SYSTEM = (
     "so in one sentence."
 )
 
+MAC_OFF_PREFIX = "Your Mac is off, so Claude is answering:"
+
 MAC_OFF_NOTICE = (
-    "Your Mac is off or asleep, so I can't get a response from Ollama. "
-    "Message me again when it's back on."
+    "Your Mac is off or asleep, so I can't get a response from Ollama, and I "
+    "couldn't get an answer from Claude either. Message me again when the Mac "
+    "is back on."
 )
 
 MAC_OFF_SYSTEM = (
-    f"You are {ASSISTANT_NAME}, the user's friendly personal assistant. Your "
-    "replies are written by an Ollama model on the user's Mac, but the Mac is "
-    "off or asleep and gives no signal. Tell the user that in one short, "
-    "friendly sentence, and that you will answer once the Mac is back on. Do "
-    "not answer anything else. Plain text."
+    f"You are {ASSISTANT_NAME}, the user's friendly personal assistant. Answer "
+    "the user's message in at most 40 words. Plain text, no markdown, no "
+    "preamble."
 )
 
 VISION_SYSTEM = (
@@ -385,34 +385,28 @@ async def send_long(update: Update, text: str) -> None:
         await update.message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
 
 
-mac_off_notified = False
+async def reply_without_mac(update: Update, user_text: str, info: Optional[str]) -> None:
+    """Ollama is unreachable: say so, and let Claude give a short answer.
 
-
-async def reply_without_mac(update: Update) -> None:
-    """Ollama is unreachable: say so and nothing more.
-
-    Claude words the first notice of an outage. Later messages in the same
-    outage get a fixed line, which costs nothing.
+    The notice is a fixed line, so only the answer itself costs tokens.
     """
-    global mac_off_notified
-    reply = None
-    if not mac_off_notified:
-        log.info("Ollama unreachable, sending the Mac-off notice")
-        reply = await ask_claude("I just sent you a message.", MAC_OFF_SYSTEM)
-        mac_off_notified = True
-    reply = reply or MAC_OFF_NOTICE
+    log.info("Ollama unreachable, replying without it")
+    # If Claude already looked this up, don't pay for a second request.
+    answer = info
+    if not answer and user_text:
+        answer = await ask_claude(user_text, MAC_OFF_SYSTEM)
+    reply = f"{MAC_OFF_PREFIX}\n\n{answer}" if answer else MAC_OFF_NOTICE
     save_message("assistant", reply)
     await send_long(update, reply)
 
 
-async def reply_locally(update: Update) -> bool:
+async def reply_locally(update: Update, user_text: str, info: Optional[str] = None) -> bool:
     """Answer the conversation so far with the local model.
 
-    Returns False when Ollama was unreachable and only the notice was sent.
+    Returns False when Ollama was unreachable and Claude filled in instead.
     """
-    global mac_off_notified
     if not await ollama_online():
-        await reply_without_mac(update)
+        await reply_without_mac(update, user_text, info)
         return False
     messages = [{"role": "system", "content": system_prompt()}]
     messages += recent_messages(HISTORY_LIMIT)
@@ -420,9 +414,8 @@ async def reply_locally(update: Update) -> bool:
         reply = await ollama_chat(messages)
     except httpx.HTTPError as exc:
         log.error("Ollama request failed: %s", exc)
-        await reply_without_mac(update)
+        await reply_without_mac(update, user_text, info)
         return False
-    mac_off_notified = False
     save_message("assistant", reply)
     await send_long(update, reply or "…")
     return True
@@ -446,12 +439,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     typing = asyncio.create_task(keep_typing(context, update.effective_chat.id))
     answered_locally = False
     try:
+        info = None
         if claude_available() and await ollama_online():
             route, question = await decide_route(user_text)
             if route != "local":
                 log.info("Asking Claude (%s)", route)
-                await look_up(question, use_web=(route == "web"))
-        answered_locally = await reply_locally(update)
+                info = await look_up(question, use_web=(route == "web"))
+        answered_locally = await reply_locally(update, user_text, info)
     finally:
         typing.cancel()
 
@@ -462,9 +456,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caption = (update.message.caption or "").strip()
-    if not await ollama_online():
-        await reply_without_mac(update)
-        return
     if claude is None:
         await update.message.reply_text(
             "I can't see photos yet. Add ANTHROPIC_API_KEY to the .env file and restart me."
@@ -506,7 +497,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         summary = description.split(". ")[0][:200]
         save_fact(f"Photo sent on {date.today():%d %B %Y}: {summary}")
-        await reply_locally(update)
+        await reply_locally(update, caption, description)
     finally:
         typing.cancel()
 
@@ -536,17 +527,15 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Claude isn't set up. Add ANTHROPIC_API_KEY to the .env file and restart me."
         )
         return
-    if not await ollama_online():
-        await reply_without_mac(update)
-        return
     save_message("user", question)
     typing = asyncio.create_task(keep_typing(context, update.effective_chat.id))
     try:
-        if not await look_up(question, use_web=True):
+        info = await look_up(question, use_web=True)
+        if not info and await ollama_online():
             await update.message.reply_text(
                 "I couldn't get help from Claude just now, so this is only my own answer."
             )
-        await reply_locally(update)
+        await reply_locally(update, question, info)
     finally:
         typing.cancel()
 

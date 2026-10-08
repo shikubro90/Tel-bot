@@ -10,8 +10,8 @@ for photos.
 - **Bot:** `bot.py`, on a small Linux server, as a systemd service.
 - **Ollama:** on the owner's Mac. The Mac keeps a private SSH tunnel open to
   the server, so the bot reaches Ollama at `127.0.0.1:11434`.
-- **Mac off or asleep:** the tunnel is down, so the bot only says so. Claude
-  words the first notice of an outage; repeats are a fixed line.
+- **Mac off or asleep:** the tunnel is down, so the bot says so and Claude
+  gives a short answer instead.
 
 ## Settings
 
