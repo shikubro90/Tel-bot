@@ -27,6 +27,13 @@ if [ -n "${TUNNEL_PUBKEY:-}" ]; then
     > /home/tunnel/.ssh/authorized_keys
   chown tunnel:tunnel /home/tunnel/.ssh/authorized_keys
   chmod 600 /home/tunnel/.ssh/authorized_keys
+
+  # Drop the tunnel within 30 seconds of the Mac going silent, so the port is
+  # free again when the Mac comes back.
+  printf 'Match User tunnel\n    ClientAliveInterval 15\n    ClientAliveCountMax 2\n' \
+    > /etc/ssh/sshd_config.d/70-telbot-tunnel.conf
+  sshd -t
+  systemctl reload ssh
 fi
 
 install -m 644 "$APP_DIR/deploy/telbot.service" "$APP_DIR/deploy/telbot-update.service" \
