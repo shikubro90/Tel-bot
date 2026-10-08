@@ -47,3 +47,10 @@ restarts the bot (`deploy/update.sh`).
 ## Commands
 
 `/ask`, `/usage`, `/remember`, `/memory`, `/forget`, `/reset`
+
+## Server logs
+
+```bash
+journalctl -u telbot -f          # the bot
+journalctl -u telbot-update -n 20  # deployments
+```
