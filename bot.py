@@ -10,6 +10,9 @@ remembered facts, only the single question or photo.
 
 The bot can run on a server while Ollama stays on the owner's Mac. When the
 Mac is off, the bot says so and Claude gives a short answer instead.
+
+A few times a day the bot also messages the owner first with a short question,
+to get to know them better. These check-ins never use Claude.
 """
 
 import asyncio
@@ -17,6 +20,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -28,7 +32,7 @@ from typing import Optional
 import anthropic
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Bot, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -51,7 +55,35 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_DAILY_LIMIT = int(os.getenv("CLAUDE_DAILY_LIMIT", "20"))
+CHECKINS_PER_DAY = int(os.getenv("CHECKINS_PER_DAY", "3"))
+CHECKIN_START_HOUR = int(os.getenv("CHECKIN_START_HOUR", "9"))
+CHECKIN_END_HOUR = int(os.getenv("CHECKIN_END_HOUR", "22"))
 DB_PATH = BASE_DIR / "memory.db"
+
+# What the check-in questions are about, each with a ready-made question for
+# when the local model can't write one.
+CHECKIN_TOPICS = {
+    "what they are doing right now": "What are you up to right now?",
+    "how their day is going": "How's your day going so far?",
+    "their favourite food and drinks": "What's your favourite thing to eat?",
+    "their favourite music, films or shows": "What have you been watching or listening to lately?",
+    "things they dislike or that annoy them": "What's something that really annoys you?",
+    "what they are good at": "What's something you're really good at?",
+    "what they find hard or want to improve": "What's one thing you'd like to get better at?",
+    "their daily routine and how they spend their time": "What does a normal day look like for you?",
+    "their wife or partner": "Tell me about your wife. What's she like?",
+    "their mother": "Tell me about your mom. What's she like?",
+    "their sister": "Do you have a sister? Tell me about her.",
+    "their brother": "Do you have a brother? Tell me about him.",
+    "their closest friends": "Who's your closest friend, and what do you like about them?",
+    "their work or studies": "What are you working on these days?",
+    "their goals and dreams": "What's a dream you're working towards?",
+    "their health and sleep": "How have you been sleeping lately?",
+    "their hobbies": "What do you love doing in your free time?",
+    "where they grew up": "Where did you grow up? What was it like?",
+    "what made them happy recently": "What made you smile recently?",
+    "what is worrying them": "Is anything on your mind lately?",
+}
 
 TELEGRAM_MAX_LEN = 4096
 # The local model saying it will ask Claude, e.g. "Let me ask Claude."
@@ -99,6 +131,21 @@ def init_db() -> None:
                 calls INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS checkins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                question TEXT NOT NULL,
+                asked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS pending_learning (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                context TEXT,
+                content TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             """
         )
@@ -149,6 +196,73 @@ def clear_facts() -> None:
         conn.execute("DELETE FROM facts")
 
 
+def last_message() -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT role, content, (julianday('now') - julianday(created_at)) * 1440 "
+            "AS minutes_ago FROM messages ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
+def last_assistant_message() -> Optional[str]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT content FROM messages WHERE role = 'assistant' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return row["content"] if row else None
+
+
+def get_setting(key: str, default: str) -> str:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def last_checkin() -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT question, (julianday('now') - julianday(asked_at)) * 24 AS hours_ago "
+            "FROM checkins ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+
+def record_checkin(topic: str, question: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO checkins (topic, question) VALUES (?, ?)", (topic, question))
+
+
+def next_checkin_topic() -> str:
+    """A topic never asked about yet, otherwise the one asked longest ago."""
+    with db() as conn:
+        asked = {
+            r["topic"]: r["latest"]
+            for r in conn.execute("SELECT topic, MAX(id) AS latest FROM checkins GROUP BY topic")
+        }
+    never_asked = [t for t in CHECKIN_TOPICS if t not in asked]
+    if never_asked:
+        return random.choice(never_asked)
+    return min(CHECKIN_TOPICS, key=lambda t: asked[t])
+
+
+def add_pending_learning(context: Optional[str], content: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO pending_learning (context, content) VALUES (?, ?)", (context, content)
+        )
+
+
+def take_pending_learning() -> list[sqlite3.Row]:
+    with db() as conn:
+        rows = conn.execute("SELECT context, content FROM pending_learning ORDER BY id").fetchall()
+        conn.execute("DELETE FROM pending_learning")
+    return rows
+
+
 def claude_usage_today() -> sqlite3.Row:
     with db() as conn:
         conn.execute(
@@ -194,6 +308,8 @@ def system_prompt() -> str:
         "Sometimes a message is followed by looked-up information in square "
         "brackets. Trust it over your own memory and base your answer on it, "
         "keeping the facts, numbers and dates exactly as given.\n\n"
+        "You sometimes text the user first with a question to get to know them. "
+        "When they answer one, react warmly in a sentence or two.\n\n"
         f"Current date and time: {now}\n\n"
         f"What you know about the user:\n{facts}"
     )
@@ -223,16 +339,22 @@ async def ollama_chat(messages: list[dict], json_mode: bool = False) -> str:
         return resp.json()["message"]["content"].strip()
 
 
-async def learn_from(user_text: str) -> None:
-    """Pull lasting facts about the user out of a message and store them."""
+async def learn_from(user_text: str, context: Optional[str] = None) -> None:
+    """Pull lasting facts about the user out of a message and store them.
+
+    context is what the assistant said just before, so that a short answer
+    like "Rima" to "what's your sister's name?" becomes a complete fact.
+    """
     prompt = (
         "From the user's message below, extract facts about the user worth "
         "remembering long-term (name, family, work, preferences, habits, plans, "
-        "important dates). Ignore small talk, questions and one-off requests. "
+        "important dates). Write each fact as a complete sentence that makes "
+        "sense on its own. Ignore small talk, questions and one-off requests. "
         "Never store passwords, card numbers or ID numbers. "
         'Reply with JSON only: {"facts": ["short fact", ...]}. '
         'If there is nothing worth remembering, reply {"facts": []}.\n\n'
-        f"Message: {user_text}"
+        + (f"The assistant had just said: {context}\n" if context else "")
+        + f"User's message: {user_text}"
     )
     try:
         raw = await ollama_chat([{"role": "user", "content": prompt}], json_mode=True)
@@ -243,6 +365,12 @@ async def learn_from(user_text: str) -> None:
     for fact in facts:
         if isinstance(fact, str) and save_fact(fact):
             log.info("Remembered a new fact")
+
+
+async def learn_pending() -> None:
+    """Learn from the messages that arrived while the Mac was off."""
+    for row in take_pending_learning():
+        await learn_from(row["content"], row["context"])
 
 
 async def decide_route(user_text: str) -> tuple[str, str]:
@@ -465,6 +593,7 @@ async def look_up(question: str, use_web: bool) -> Optional[str]:
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text
+    said_before = last_assistant_message()
     save_message("user", user_text)
 
     typing = asyncio.create_task(keep_typing(context, update.effective_chat.id))
@@ -485,9 +614,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     finally:
         typing.cancel()
 
-    # Learning facts needs the local model, so it is skipped while the Mac is off.
+    # Learning facts needs the local model, so while the Mac is off the message
+    # is kept and learned from once the Mac is back.
     if answered_locally:
-        context.application.create_task(learn_from(user_text))
+        context.application.create_task(learn_from(user_text, said_before))
+        context.application.create_task(learn_pending())
+    else:
+        add_pending_learning(said_before, user_text)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -541,10 +674,99 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.application.create_task(learn_from(caption))
 
 
+# ---------- check-ins ----------
+
+def checkin_gap_seconds() -> float:
+    """Average time between check-ins, spread over the waking hours."""
+    return (CHECKIN_END_HOUR - CHECKIN_START_HOUR) * 3600 / CHECKINS_PER_DAY
+
+
+async def write_checkin_question(topic: str) -> str:
+    ready_made = CHECKIN_TOPICS[topic]
+    if not await ollama_online():
+        return ready_made
+    facts = "\n".join(f"- {r['fact']}" for r in all_facts()) or "- (nothing yet)"
+    prompt = (
+        f"You are {ASSISTANT_NAME}, the user's close friend, texting them first "
+        "to get to know them better. Write one short, warm, casual question, at "
+        f"most 15 words, about {topic}. This is what you already know about "
+        f"them, so ask something new and don't repeat it:\n{facts}\n\n"
+        "Don't assume anything that isn't listed: if you don't know whether "
+        "they have such a person or thing in their life, ask that first. "
+        "Reply with the question only."
+    )
+    try:
+        question = (await ollama_chat([{"role": "user", "content": prompt}])).strip().strip('"')
+    except Exception as exc:
+        log.warning("Could not write a check-in question: %s", exc)
+        return ready_made
+    # A small model sometimes rambles; use the ready-made question then.
+    return question if "?" in question and len(question) <= 160 else ready_made
+
+
+async def send_checkin(bot: Bot, force: bool = False) -> bool:
+    """Text the owner a question. Unless forced, only when it won't be a nuisance."""
+    if not force:
+        if get_setting("checkins", "on") != "on":
+            return False
+        if not CHECKIN_START_HOUR <= datetime.now().hour < CHECKIN_END_HOUR:
+            return False
+        latest = last_message()
+        if latest and latest["minutes_ago"] < 10:
+            return False  # in the middle of a conversation
+        previous = last_checkin()
+        if previous:
+            if previous["hours_ago"] * 3600 < checkin_gap_seconds() / 2:
+                return False
+            unanswered = (
+                latest
+                and latest["role"] == "assistant"
+                and latest["content"] == previous["question"]
+            )
+            if unanswered and previous["hours_ago"] < 24:
+                return False  # don't pile up questions
+
+    topic = next_checkin_topic()
+    question = await write_checkin_question(topic)
+    await bot.send_message(chat_id=int(OWNER_ID), text=question)
+    save_message("assistant", question)
+    record_checkin(topic, question)
+    log.info("Sent a check-in question")
+    return True
+
+
+async def checkin_loop(app: Application) -> None:
+    """Ask a question at irregular times through the day."""
+    while True:
+        await asyncio.sleep(random.uniform(0.6, 1.4) * checkin_gap_seconds())
+        try:
+            await send_checkin(app.bot)
+        except Exception:
+            log.exception("Check-in failed")
+
+
+async def cmd_askme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_checkin(context.bot, force=True)
+
+
+async def cmd_checkins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "off"):
+        set_setting("checkins", arg)
+    state = get_setting("checkins", "on")
+    await update.message.reply_text(
+        f"Check-in questions are {state}. I ask about {CHECKINS_PER_DAY} a day between "
+        f"{CHECKIN_START_HOUR}:00 and {CHECKIN_END_HOUR}:00. "
+        "Use /checkins on or /checkins off to change this."
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Hey, I'm {ASSISTANT_NAME}. Just talk to me, or send me a photo.\n\n"
         "/ask <question> – look something up with Claude\n"
+        "/askme – I ask you a question now\n"
+        "/checkins on|off – whether I text you questions by myself\n"
         "/usage – how much Claude I've used today\n"
         "/remember <fact> – tell me something to keep\n"
         "/memory – see what I know about you\n"
@@ -624,8 +846,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Chat history cleared. I still know you, though.")
 
 
-async def sync_bot_name(app: Application) -> None:
-    """Make the name shown at the top of the Telegram chat match ASSISTANT_NAME."""
+async def on_startup(app: Application) -> None:
+    """Start the check-ins and make the Telegram display name match ASSISTANT_NAME."""
+    if CHECKINS_PER_DAY > 0:
+        app.bot_data["checkin_task"] = asyncio.create_task(checkin_loop(app))
     try:
         if (await app.bot.get_my_name()).name != ASSISTANT_NAME:
             await app.bot.set_my_name(ASSISTANT_NAME)
@@ -647,10 +871,12 @@ def main() -> None:
     # Owner lock: every handler ignores anyone who isn't OWNER_ID.
     owner = filters.User(user_id=int(OWNER_ID))
 
-    app = Application.builder().token(BOT_TOKEN).post_init(sync_bot_name).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start", cmd_start, filters=owner))
     app.add_handler(CommandHandler("ask", cmd_ask, filters=owner))
     app.add_handler(CommandHandler("usage", cmd_usage, filters=owner))
+    app.add_handler(CommandHandler("askme", cmd_askme, filters=owner))
+    app.add_handler(CommandHandler("checkins", cmd_checkins, filters=owner))
     app.add_handler(CommandHandler("remember", cmd_remember, filters=owner))
     app.add_handler(CommandHandler("memory", cmd_memory, filters=owner))
     app.add_handler(CommandHandler("forget", cmd_forget, filters=owner))

@@ -26,6 +26,7 @@ Copy these into a `.env` file next to `bot.py`. It is never committed.
 | `HISTORY_LIMIT` | How many recent messages the model sees |
 | `ANTHROPIC_API_KEY` | Optional. Leave empty to stay fully local |
 | `CLAUDE_MODEL`, `CLAUDE_DAILY_LIMIT` | Claude model and the most requests per day |
+| `CHECKINS_PER_DAY`, `CHECKIN_START_HOUR`, `CHECKIN_END_HOUR` | How often, and between which hours, the bot texts the owner a question first (0 turns it off) |
 
 ## Run locally
 
@@ -46,7 +47,7 @@ restarts the bot (`deploy/update.sh`).
 
 ## Commands
 
-`/ask`, `/usage`, `/remember`, `/memory`, `/forget`, `/reset`
+`/ask`, `/askme`, `/checkins`, `/usage`, `/remember`, `/memory`, `/forget`, `/reset`
 
 ## Server logs
 
