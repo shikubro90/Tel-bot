@@ -22,6 +22,7 @@ Copy these into a `.env` file next to `bot.py`. It is never committed.
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 | `OWNER_ID` | Numeric Telegram ID of the only account allowed to use the bot (`whoami.py` finds it) |
 | `ASSISTANT_NAME` | What the assistant calls itself |
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Optional OpenAI-compatible cloud model. When all three are set it replaces Ollama |
 | `OLLAMA_MODEL`, `OLLAMA_URL` | Local model and where to reach it |
 | `HISTORY_LIMIT` | How many recent messages the model sees |
 | `ANTHROPIC_API_KEY` | Optional. Leave empty to stay fully local |

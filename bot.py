@@ -1,15 +1,18 @@
-"""Private Telegram assistant backed by a local Ollama model.
+"""Private Telegram assistant.
+
+The main model is either an OpenAI-compatible cloud model (when LLM_BASE_URL,
+LLM_API_KEY and LLM_MODEL are set) or a local Ollama model.
 
 Only the owner (OWNER_ID) can talk to it. Chat history and remembered facts
 are stored in a local SQLite file next to this script.
 
-Ollama answers everything by default. Claude is an optional helper, used only
+The main model answers everything by default. Claude is an optional helper, used only
 when the local model decides it needs fresh or expert information, when the
 owner sends a photo, or on /ask. Claude never sees the chat history or the
 remembered facts, only the single question or photo.
 
 The bot can run on a server while Ollama stays on the owner's Mac. When the
-Mac is off, the bot says so and Claude gives a short answer instead.
+main model can't be reached, the bot says so and Claude gives a short answer.
 
 A few times a day the bot also messages the owner first with a short question,
 to get to know them better. These check-ins never use Claude.
@@ -52,6 +55,11 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Buddy")
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip().rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
+USE_CLOUD_LLM = bool(LLM_BASE_URL and LLM_API_KEY and LLM_MODEL)
+MAIN_MODEL = LLM_MODEL if USE_CLOUD_LLM else OLLAMA_MODEL
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_DAILY_LIMIT = int(os.getenv("CLAUDE_DAILY_LIMIT", "20"))
@@ -86,6 +94,8 @@ CHECKIN_TOPICS = {
 }
 
 TELEGRAM_MAX_LEN = 4096
+# Reasoning that some models write before their answer.
+THINKING = re.compile(r"<think>.*?</think>", re.DOTALL)
 # The local model saying it will ask Claude, e.g. "Let me ask Claude."
 ASKS_CLAUDE = re.compile(
     r"\b(ask|check with|consult|get help from|reach out to)\s+(my\s+)?(\w+\s+){0,3}?claude\b",
@@ -297,9 +307,7 @@ def system_prompt() -> str:
         "Talk like a warm, relaxed friend: short, natural messages, no lectures, "
         "no bullet lists unless asked. Use what you know about the user naturally, "
         "without reciting it back. If you don't know something, say so.\n\n"
-        f"If asked what you run on: you are the open model {OLLAMA_MODEL}, running "
-        "locally on the user's own Mac through Ollama. Never invent another "
-        "model name.\n\n"
+        f"If asked what you run on: {RUNS_ON} Never invent another model name.\n\n"
         "Claude is a cloud model that can help you. When you cannot answer "
         'something yourself, reply with only "Let me ask Claude." and nothing '
         "else; the answer is then looked up and given to you. Never say that "
@@ -315,8 +323,23 @@ def system_prompt() -> str:
     )
 
 
-async def ollama_online() -> bool:
-    """Quick check that Ollama answers; False when the Mac is off or asleep."""
+if USE_CLOUD_LLM:
+    RUNS_ON = f"you are the model {LLM_MODEL}, running on Betopia Cloud."
+else:
+    RUNS_ON = (
+        f"you are the open model {OLLAMA_MODEL}, running locally on the user's "
+        "own Mac through Ollama."
+    )
+
+
+async def main_model_online() -> bool:
+    """Quick check that the main model can be reached.
+
+    A cloud model is assumed to be up; if a request fails, the reply falls
+    back to Claude anyway. Ollama is down whenever the Mac is off or asleep.
+    """
+    if USE_CLOUD_LLM:
+        return True
     try:
         async with httpx.AsyncClient(timeout=4) as client:
             return (await client.get(f"{OLLAMA_URL}/api/version")).status_code == 200
@@ -324,7 +347,9 @@ async def ollama_online() -> bool:
         return False
 
 
-async def ollama_chat(messages: list[dict], json_mode: bool = False) -> str:
+async def main_chat(messages: list[dict], json_mode: bool = False) -> str:
+    if USE_CLOUD_LLM:
+        return await cloud_chat(messages, json_mode)
     payload = {
         "model": OLLAMA_MODEL,
         "messages": messages,
@@ -337,6 +362,23 @@ async def ollama_chat(messages: list[dict], json_mode: bool = False) -> str:
         resp = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()
+
+
+async def cloud_chat(messages: list[dict], json_mode: bool) -> str:
+    """Chat with an OpenAI-compatible cloud model."""
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            f"{LLM_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            json={"model": LLM_MODEL, "messages": messages, "stream": False},
+        )
+        resp.raise_for_status()
+        text = THINKING.sub("", resp.json()["choices"][0]["message"]["content"] or "").strip()
+    if json_mode:
+        # The prompts ask for JSON only; keep just the object if there is extra text.
+        found = re.search(r"\{.*\}", text, re.DOTALL)
+        return found.group(0) if found else text
+    return text
 
 
 async def learn_from(user_text: str, context: Optional[str] = None) -> None:
@@ -357,7 +399,7 @@ async def learn_from(user_text: str, context: Optional[str] = None) -> None:
         + f"User's message: {user_text}"
     )
     try:
-        raw = await ollama_chat([{"role": "user", "content": prompt}], json_mode=True)
+        raw = await main_chat([{"role": "user", "content": prompt}], json_mode=True)
         facts = json.loads(raw).get("facts", [])
     except Exception as exc:
         log.warning("Could not extract facts: %s", exc)
@@ -368,7 +410,7 @@ async def learn_from(user_text: str, context: Optional[str] = None) -> None:
 
 
 async def learn_pending() -> None:
-    """Learn from the messages that arrived while the Mac was off."""
+    """Learn from the messages that arrived while the main model was down."""
     for row in take_pending_learning():
         await learn_from(row["content"], row["context"])
 
@@ -405,7 +447,7 @@ async def decide_route(user_text: str) -> tuple[str, str]:
         f"Latest message: {user_text}"
     )
     try:
-        raw = await ollama_chat([{"role": "user", "content": prompt}], json_mode=True)
+        raw = await main_chat([{"role": "user", "content": prompt}], json_mode=True)
         decision = json.loads(raw)
         route = decision.get("route", "local")
         question = str(decision.get("question", "")).strip()
@@ -489,15 +531,21 @@ RESEARCH_SYSTEM = (
     "so in one sentence."
 )
 
-MAC_OFF_PREFIX = "Your Mac is off, so Claude is answering:"
+if USE_CLOUD_LLM:
+    MODEL_DOWN_PREFIX = "My main model isn't responding right now, so Claude is answering:"
+    MODEL_DOWN_NOTICE = (
+        "My main model isn't responding right now, and I couldn't get an answer "
+        "from Claude either. Please try again in a little while."
+    )
+else:
+    MODEL_DOWN_PREFIX = "Your Mac is off, so Claude is answering:"
+    MODEL_DOWN_NOTICE = (
+        "Your Mac is off or asleep, so I can't get a response from Ollama, and I "
+        "couldn't get an answer from Claude either. Message me again when the Mac "
+        "is back on."
+    )
 
-MAC_OFF_NOTICE = (
-    "Your Mac is off or asleep, so I can't get a response from Ollama, and I "
-    "couldn't get an answer from Claude either. Message me again when the Mac "
-    "is back on."
-)
-
-MAC_OFF_SYSTEM = (
+MODEL_DOWN_SYSTEM = (
     f"You are {ASSISTANT_NAME}, the user's friendly personal assistant. Answer "
     "the user's message in at most 40 words. Plain text, no markdown, no "
     "preamble."
@@ -524,17 +572,17 @@ async def send_long(update: Update, text: str) -> None:
         await update.message.reply_text(text[i : i + TELEGRAM_MAX_LEN])
 
 
-async def reply_without_mac(update: Update, user_text: str, info: Optional[str]) -> None:
-    """Ollama is unreachable: say so, and let Claude give a short answer.
+async def reply_without_main_model(update: Update, user_text: str, info: Optional[str]) -> None:
+    """The main model is unreachable: say so, and let Claude give a short answer.
 
     The notice is a fixed line, so only the answer itself costs tokens.
     """
-    log.info("Ollama unreachable, replying without it")
+    log.info("Main model unreachable, replying without it")
     # If Claude already looked this up, don't pay for a second request.
     answer = info
     if not answer and user_text:
-        answer = await ask_claude(user_text, MAC_OFF_SYSTEM)
-    reply = f"{MAC_OFF_PREFIX}\n\n{answer}" if answer else MAC_OFF_NOTICE
+        answer = await ask_claude(user_text, MODEL_DOWN_SYSTEM)
+    reply = f"{MODEL_DOWN_PREFIX}\n\n{answer}" if answer else MODEL_DOWN_NOTICE
     save_message("assistant", reply)
     await send_long(update, reply)
 
@@ -544,18 +592,18 @@ async def reply_locally(
 ) -> Optional[str]:
     """Answer the conversation so far with the local model.
 
-    Returns the reply, or None when Ollama was unreachable and Claude filled in.
+    Returns the reply, or None when the main model was unreachable and Claude filled in.
     """
-    if not await ollama_online():
-        await reply_without_mac(update, user_text, info)
+    if not await main_model_online():
+        await reply_without_main_model(update, user_text, info)
         return None
     messages = [{"role": "system", "content": system_prompt()}]
     messages += recent_messages(HISTORY_LIMIT)
     try:
-        reply = await ollama_chat(messages)
-    except httpx.HTTPError as exc:
-        log.error("Ollama request failed: %s", exc)
-        await reply_without_mac(update, user_text, info)
+        reply = await main_chat(messages)
+    except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
+        log.error("Main model request failed: %s", exc)
+        await reply_without_main_model(update, user_text, info)
         return None
     reply = reply or "…"
     save_message("assistant", reply)
@@ -600,7 +648,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     answered_locally = False
     try:
         info = None
-        if claude_available() and await ollama_online():
+        if claude_available() and await main_model_online():
             route, question = await decide_route(user_text)
             if route != "local":
                 log.info("Asking Claude (%s)", route)
@@ -614,8 +662,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     finally:
         typing.cancel()
 
-    # Learning facts needs the local model, so while the Mac is off the message
-    # is kept and learned from once the Mac is back.
+    # Learning facts needs the main model, so while it is down the message is
+    # kept and learned from once it is back.
     if answered_locally:
         context.application.create_task(learn_from(user_text, said_before))
         context.application.create_task(learn_pending())
@@ -683,7 +731,7 @@ def checkin_gap_seconds() -> float:
 
 async def write_checkin_question(topic: str) -> str:
     ready_made = CHECKIN_TOPICS[topic]
-    if not await ollama_online():
+    if not await main_model_online():
         return ready_made
     facts = "\n".join(f"- {r['fact']}" for r in all_facts()) or "- (nothing yet)"
     prompt = (
@@ -696,7 +744,7 @@ async def write_checkin_question(topic: str) -> str:
         "Reply with the question only."
     )
     try:
-        question = (await ollama_chat([{"role": "user", "content": prompt}])).strip().strip('"')
+        question = (await main_chat([{"role": "user", "content": prompt}])).strip().strip('"')
     except Exception as exc:
         log.warning("Could not write a check-in question: %s", exc)
         return ready_made
@@ -789,7 +837,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     typing = asyncio.create_task(keep_typing(context, update.effective_chat.id))
     try:
         info = await look_up(question, use_web=True)
-        if not info and await ollama_online():
+        if not info and await main_model_online():
             await update.message.reply_text(
                 "I couldn't get help from Claude just now, so this is only my own answer."
             )
@@ -886,7 +934,7 @@ def main() -> None:
 
     log.info(
         "%s is running with model %s at %s. Press Ctrl+C to stop.",
-        ASSISTANT_NAME, OLLAMA_MODEL, OLLAMA_URL,
+        ASSISTANT_NAME, MAIN_MODEL, LLM_BASE_URL if USE_CLOUD_LLM else OLLAMA_URL,
     )
     if claude is None:
         log.info("Claude helper is off (no ANTHROPIC_API_KEY in .env).")
